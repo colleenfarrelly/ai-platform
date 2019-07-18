@@ -1,0 +1,130 @@
+#Project with stock market time series data (cluster multivariate time series,
+#forecast the last 7 days of each time series with multiple methods,
+#compare the time series trends statistically)
+
+#Load dataset (from the same folder as R)
+mydata<-read.csv("ExampleStock.csv")
+
+#Columns of interest are daily high and low market values (columns 2 and 3).
+#We also want to look at the daily fluctuation (column 4).
+mydata<-mydata[,2:4]
+
+#Part 1:
+#Cluster multivariate time series using Morse-Smale clustering
+#We'll use typical parameters for most of the algorithm.
+#100 nearest neighbors ~3% of the total sample, which should
+#be sufficient for good clustering. The bandwidth of the kernel
+#is set to near-recommended settings, and 5 levels allows for
+#a few layers of clustering and persistent features in the data.
+library(msr)
+mskd1<-msc.nn.kd(y=mydata[,3],x=mydata[,1:2],knn=100,bw=0.5,nLevels=5)
+clust<-mskd1$level[[5]]$partition
+
+#We can examine the distribution of the clusters across the time series.
+table(clust) #Gives the number of time points within each cluster
+plot(mydata[,3],col=clust,xlab="Days from Start",ylab="Daily Fluctuation",
+main="Daily Fluctuation Clustering")
+#This shows that several potential transition points exist within the series,
+#particularly within the last couple of years (furthest right points).
+
+
+#Part 2:
+#Let's move on to predicting the last weeks' worth of data for high
+#and low prices.
+#We'll use a typical method (singular spectrum analysis) and a time-lagged
+#machine learning model for our prediction.
+#Let's first split out the data.
+train<-mydata[1:3609,]
+test<-mydata[3610:3616,]
+
+#We'll start with the SSA model, using multichannel methods that
+#capture multivariate trends. We'll use a week as the periodicity.
+#It's possible to tune this parameter using grid search methods, though. 
+library(Rssa)
+ts1<-ssa(train,kind="mssa",L=7)
+
+#Predict the next week's values using vector results 
+#of the SSA decomposition. We'll focus on fluctuation results.
+v<-vforecast(ts1,len=7)
+
+#Compare with the true values and calculate mean square error of the model.
+msessa<-sum((v$F1[,3]-test[,3])^2)
+
+#Let's compare with a time-lagged machine learning model predicting the
+#last week's volatility.
+library(caret)
+#Create time lags for dataset.
+mydata1<-mydata[-1,]
+mydata2<-mydata[-c(1:2),]
+final<-cbind(mydata2,mydata1[-3615,],mydata[-c(3615:3616),])
+
+#Split data to training and test again, leaving out the last week.
+train<-final[1:3607,]
+test<-final[3608:3614,]
+
+#Create the KNN model, again choosing 100 as the number of nearest neighbors.
+#Let's do a grid search to optimize this time, leaving out the last 7 time
+#points and considering 1-300 neighbors. This should give cover the range
+#in which the optimal number of neighors exists
+vec<-rep(NA,300)
+
+for (i in 1:300){
+knn1<-knnreg(train[-c(3601:3607),-c(1:3)],train[-c(3601:3607),3],k=i)
+pred<-predict(knn1,train[3601:3607,-c(1:3)],train[3601:3607,3])
+vec[i]<-sum((pred-train[3601:3607,3])^2)
+}
+
+#We can either look at the plot to choose a decent value for number of nearest
+#neighbors, or we can find the vector's minimum value.
+plot(vec)
+opt<-which.min(vec)
+
+#This gives an optimum k=1. However, there seems to be some instability
+#in the first few k values of our grid search. We'll set it to the lowest
+#value greater than 5 to ensure stability.
+#Let's now create our forecast model.
+knn2<-knnreg(train[,-c(1:3)],train[,3],k=which.min(vec[-c(1:5)]))
+pred2<-predict(knn2,test[,-c(1:3)],test[,3])
+mseknn<-sum((pred2-test[,3])^2)
+
+#This gives a much lower error on the test set (~36000) than MSSA (~4600000).
+#This forecast predicts the next 7 days' fluctuation as follows:
+#199.4241 205.3260 188.3482 200.6000 188.3482 195.1463 185.4019
+
+#The true values for the last 7 days' fluctuation are:
+#297.0000 145.0000 116.5498 190.0000 171.5000  89.0000 263.1504
+#This is pretty close to our KNN time-lagged model.
+
+
+#Part 3:
+#Now, let's move on to distinguishing between two different time series.
+#We'll compare predicted fluctuation time series using a geometrically-
+#based method, sum of Frechet distance. It is computationally-intensive,
+#and longer series should be avoided.
+library(TSdist)
+#Frechet distance is calculated for the KNN model and the true values 
+#for the last week.
+dis1<-FrechetDistance(pred2,test[,3],FrechetSumOrMax="sum")
+#This gives a sum of distance equal to 435.
+
+#Frechet distance is calculated for the SSA model and the true values
+#for the last week.
+dis2<-FrechetDistance(v$F1[,3],test[,3],FrechetSumOrMax="sum")
+#This gives a sum of distance equal to 5649.
+
+#We can create a nonparametric test to see if either of these predicted
+#values is outside a random time series. We'll permute the test set
+#to obtain a comparison distribution.
+fd<-rep(NA,100)
+
+for (i in 1:100){
+fd[i]<-FrechetDistance(sample(test[,3],7),test[,3],FrechetSumOrMax="sum")}
+
+#Now, we can obtain the 95% confidence intervals.
+q<-quantile(fd,c(0.025,0.975))
+
+#This gives a confidence interval of (173,590).
+#Our KNN model's summed Frechet distance (435) from the true values 
+#is within this range, suggesting that it does not differ significantly 
+#from the true values. However, the SSA model does not fall within this 
+#range, suggesting that it is not a good model to use.
